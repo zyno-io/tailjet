@@ -1,0 +1,4 @@
+/tailjet
+/bin/
+*.out
+coverage.*

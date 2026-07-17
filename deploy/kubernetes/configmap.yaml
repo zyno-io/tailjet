@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tailjet
+data:
+  GOMEMLIMIT: 220MiB
+  TAILJET_MYSQL_HOST: mysql.database.svc.cluster.local
+  TAILJET_MYSQL_PORT: "3306"
+  TAILJET_MYSQL_USER: tailjet
+  TAILJET_MYSQL_DATABASE: app
+  TAILJET_MYSQL_FLAVOR: mysql
+  TAILJET_MYSQL_SERVER_ID: "240024"
+  TAILJET_MYSQL_TLS_MODE: verify
+  TAILJET_OUTBOX_TABLE: tailjet_outbox
+  TAILJET_STATE_TABLE: tailjet_state
+  TAILJET_CONSUMER_NAME: default
+  TAILJET_NATS_URL: nats://nats.messaging.svc.cluster.local:4222
+  TAILJET_NATS_EXPECTED_STREAM: EVENTS
+  TAILJET_PUBLISH_TIMEOUT: 10s
+  TAILJET_CHECKPOINT_INTERVAL: 5s

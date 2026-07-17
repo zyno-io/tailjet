@@ -1,0 +1,62 @@
+services:
+  mysql:
+    image: mysql:8.4.10
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --binlog-transaction-compression=ON
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: tailjet
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./examples/mysql-init.sql:/docker-entrypoint-initdb.d/10-tailjet.sql:ro
+
+  nats:
+    image: nats:2.14.1-alpine
+    command: ["--jetstream", "--store_dir=/data"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  nats-init:
+    image: natsio/nats-box:0.19.5
+    depends_on:
+      - nats
+    restart: on-failure
+    command:
+      - sh
+      - -ec
+      - |
+        nats --server=nats://nats:4222 stream info EVENTS >/dev/null 2>&1 ||
+          nats --server=nats://nats:4222 stream add EVENTS \
+            --subjects='events.>' \
+            --storage=file \
+            --replicas=1 \
+            --dupe-window=24h \
+            --defaults
+
+  tailjet:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    environment:
+      TAILJET_MYSQL_HOST: mysql
+      TAILJET_MYSQL_USER: tailjet
+      TAILJET_MYSQL_PASSWORD: tailjet
+      TAILJET_MYSQL_DATABASE: tailjet
+      TAILJET_NATS_URL: nats://nats:4222
+      TAILJET_NATS_EXPECTED_STREAM: EVENTS
+    ports:
+      - "18080:8080"

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tailjet
+spec:
+  selector:
+    app.kubernetes.io/name: tailjet
+  ports:
+    - name: health
+      port: 8080
+      targetPort: health
