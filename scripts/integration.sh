@@ -77,6 +77,17 @@ CREATE TABLE tailjet_outbox (
   PRIMARY KEY (id),
   UNIQUE KEY uq_tailjet_message_id (message_id)
 ) ENGINE=InnoDB"
+read -r legacy_binlog legacy_position _ <<<"$(mysql_query "SHOW BINARY LOG STATUS")"
+mysql_query "
+CREATE TABLE tailjet_state (
+  consumer_name VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  binlog_name VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  binlog_position BIGINT UNSIGNED NOT NULL,
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (consumer_name)
+) ENGINE=InnoDB;
+INSERT INTO tailjet_state (consumer_name, binlog_name, binlog_position)
+VALUES ('default', '${legacy_binlog}', ${legacy_position})"
 docker compose up -d --build tailjet
 wait_for_ready
 
@@ -90,6 +101,9 @@ WHERE TABLE_SCHEMA='tailjet'
   echo "managed failure columns were not created" >&2
   exit 1
 }
+
+wait_for_sql "1" "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='tailjet' AND TABLE_NAME='tailjet_state' AND COLUMN_NAME='gtid_set' AND DATA_TYPE='longtext'"
+wait_for_sql "1" "SELECT COUNT(*) FROM tailjet_state WHERE consumer_name='default' AND gtid_set IS NOT NULL AND CHAR_LENGTH(gtid_set) > 0"
 
 before_rollback=$(stream_messages)
 mysql_query "

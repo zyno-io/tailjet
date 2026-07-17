@@ -7,6 +7,8 @@ services:
       - --binlog-format=ROW
       - --binlog-row-image=FULL
       - --binlog-transaction-compression=ON
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: tailjet

@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+
 	"github.com/zyno-io/tailjet/internal/config"
 	"github.com/zyno-io/tailjet/internal/health"
 	"github.com/zyno-io/tailjet/internal/outbox"
@@ -95,10 +98,14 @@ func TestCommitCheckpointsPastFailedRows(t *testing.T) {
 		outboxTable:        "tailjet_outbox",
 	}
 
-	if err := processor.commit(context.Background(), 123); err != nil {
+	gtidSet, err := gomysql.ParseGTIDSet(gomysql.MySQLFlavor, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-7")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if store.position != (outbox.Position{Name: "mysql-bin.000001", Pos: 123}) {
+	if err := processor.commit(context.Background(), 123, gtidSet); err != nil {
+		t.Fatal(err)
+	}
+	if store.position != (outbox.Position{Name: "mysql-bin.000001", Pos: 123, GTID: gtidSet.String()}) {
 		t.Fatalf("position = %#v", store.position)
 	}
 	if !slices.Equal(store.succeeded, []uint64{2}) || len(store.failed) != 1 || store.failed[0].ID != 1 {
@@ -127,7 +134,7 @@ func TestCancelledPublishDoesNotAdvanceCheckpoint(t *testing.T) {
 		logger:      testLogger(),
 	}
 
-	if err := processor.commit(ctx, 123); !errors.Is(err, context.Canceled) {
+	if err := processor.commit(ctx, 123, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v", err)
 	}
 	if store.position != (outbox.Position{}) {
@@ -135,6 +142,34 @@ func TestCancelledPublishDoesNotAdvanceCheckpoint(t *testing.T) {
 	}
 	if len(processor.pending) != 1 {
 		t.Fatal("pending row was cleared")
+	}
+}
+
+func TestCompressedTransactionCarriesGTIDIntoCheckpoint(t *testing.T) {
+	gtidSet, err := gomysql.ParseGTIDSet(gomysql.MySQLFlavor, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &recordingCheckpointStore{}
+	processor := &streamProcessor{
+		currentFile:        "mysql-bin.000002",
+		lastCheckpoint:     time.Now().Add(-time.Minute),
+		checkpointInterval: time.Second,
+		store:              store,
+		health:             health.NewTracker(),
+	}
+	event := &replication.BinlogEvent{
+		Header: &replication.EventHeader{LogPos: 456},
+		Event: &replication.TransactionPayloadEvent{Events: []*replication.BinlogEvent{
+			{Event: &replication.XIDEvent{GSet: gtidSet}},
+		}},
+	}
+	if err := processor.process(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	want := outbox.Position{Name: "mysql-bin.000002", Pos: 456, GTID: gtidSet.String()}
+	if !slices.Equal(store.saves, []outbox.Position{want}) {
+		t.Fatalf("saved positions = %#v", store.saves)
 	}
 }
 
