@@ -30,6 +30,7 @@ func (m Message) Size() int64 {
 type Position struct {
 	Name string
 	Pos  uint32
+	GTID string
 }
 
 type ColumnIndexes struct {

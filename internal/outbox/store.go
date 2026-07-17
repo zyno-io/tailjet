@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	mysqldriver "github.com/go-sql-driver/mysql"
 )
 
@@ -75,11 +76,15 @@ CREATE TABLE IF NOT EXISTS %s (
     consumer_name VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     binlog_name VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     binlog_position BIGINT UNSIGNED NOT NULL,
+    gtid_set LONGTEXT NULL,
     updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (consumer_name)
 ) ENGINE=InnoDB`, s.qualified(s.stateTable))
 	if _, err := s.db.ExecContext(ctx, stateDDL); err != nil {
 		return fmt.Errorf("create checkpoint table: %w", err)
+	}
+	if err := s.ensureColumn(ctx, s.stateTable, "gtid_set", "LONGTEXT NULL AFTER binlog_position"); err != nil {
+		return err
 	}
 	if err := s.validateSchema(ctx); err != nil {
 		return err
@@ -155,6 +160,7 @@ WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`, s.database, table).Scan(&engine)
 		{"binlog_position", func(c columnDefinition) bool {
 			return c.dataType == "bigint" && strings.Contains(c.columnType, "unsigned") && !c.nullable
 		}},
+		{"gtid_set", func(c columnDefinition) bool { return c.dataType == "longtext" && c.nullable }},
 		{"updated_at", func(c columnDefinition) bool {
 			return (c.dataType == "timestamp" || c.dataType == "datetime") && !c.nullable
 		}},
@@ -304,6 +310,14 @@ SELECT CAST(@@GLOBAL.log_bin AS CHAR), @@GLOBAL.binlog_format, @@GLOBAL.binlog_r
 	return nil
 }
 
+func (s *Store) GTIDEnabled(ctx context.Context) (bool, error) {
+	var mode string
+	if err := s.db.QueryRowContext(ctx, "SELECT @@GLOBAL.gtid_mode").Scan(&mode); err != nil {
+		return false, fmt.Errorf("read MySQL GTID mode: %w", err)
+	}
+	return strings.EqualFold(mode, "ON"), nil
+}
+
 func (s *Store) ColumnIndexes(ctx context.Context) (ColumnIndexes, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT COLUMN_NAME, ORDINAL_POSITION
@@ -377,10 +391,11 @@ func ReleaseLeader(ctx context.Context, conn *sql.Conn, lockName string) {
 func (s *Store) LoadPosition(ctx context.Context) (Position, bool, error) {
 	var position Position
 	var value uint64
+	var gtid sql.NullString
 	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
-SELECT binlog_name, binlog_position
+SELECT binlog_name, binlog_position, gtid_set
 FROM %s
-WHERE consumer_name = ?`, s.qualified(s.stateTable)), s.consumerName).Scan(&position.Name, &value)
+WHERE consumer_name = ?`, s.qualified(s.stateTable)), s.consumerName).Scan(&position.Name, &value, &gtid)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Position{}, false, nil
 	}
@@ -391,6 +406,9 @@ WHERE consumer_name = ?`, s.qualified(s.stateTable)), s.consumerName).Scan(&posi
 		return Position{}, false, fmt.Errorf("checkpoint position %d exceeds the replication protocol limit", value)
 	}
 	position.Pos = uint32(value)
+	if gtid.Valid {
+		position.GTID = gtid.String
+	}
 	return position, true, nil
 }
 
@@ -418,12 +436,13 @@ func (s *Store) savePositionAndApply(
 		return err
 	}
 	query := fmt.Sprintf(`
-INSERT INTO %s (consumer_name, binlog_name, binlog_position)
-VALUES (?, ?, ?)
+INSERT INTO %s (consumer_name, binlog_name, binlog_position, gtid_set)
+VALUES (?, ?, ?, NULLIF(?, ''))
 ON DUPLICATE KEY UPDATE
     binlog_name = VALUES(binlog_name),
-    binlog_position = VALUES(binlog_position)`, s.qualified(s.stateTable))
-	if _, err := tx.ExecContext(ctx, query, s.consumerName, position.Name, position.Pos); err != nil {
+    binlog_position = VALUES(binlog_position),
+    gtid_set = VALUES(gtid_set)`, s.qualified(s.stateTable))
+	if _, err := tx.ExecContext(ctx, query, s.consumerName, position.Name, position.Pos, position.GTID); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -545,6 +564,10 @@ func (s *Store) masterPositionWithQuery(ctx context.Context, query string) (Posi
 		return Position{}, err
 	}
 	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return Position{}, err
+	}
 	values, err := scanFirstRow(rows)
 	if err != nil {
 		return Position{}, err
@@ -560,10 +583,29 @@ func (s *Store) masterPositionWithQuery(ctx context.Context, query string) (Posi
 	if name == "" {
 		return Position{}, errors.New("binary log status returned an empty log name")
 	}
-	return Position{Name: name, Pos: uint32(posValue)}, nil
+	position := Position{Name: name, Pos: uint32(posValue)}
+	for i, column := range columns {
+		if !strings.EqualFold(column, "Executed_Gtid_Set") || i >= len(values) {
+			continue
+		}
+		raw := strings.TrimSpace(stringValue(values[i]))
+		if raw == "" {
+			break
+		}
+		set, err := gomysql.ParseGTIDSet(gomysql.MySQLFlavor, raw)
+		if err != nil {
+			return Position{}, fmt.Errorf("parse executed GTID set: %w", err)
+		}
+		position.GTID = set.String()
+		break
+	}
+	return position, nil
 }
 
 func (s *Store) PositionAvailable(ctx context.Context, position Position) (bool, error) {
+	if position.GTID != "" {
+		return s.gtidPositionAvailable(ctx, position.GTID)
+	}
 	if position.Pos < 4 {
 		return false, nil
 	}
@@ -589,6 +631,30 @@ func (s *Store) PositionAvailable(ctx context.Context, position Position) (bool,
 		return false, fmt.Errorf("iterate binary logs: %w", err)
 	}
 	return false, nil
+}
+
+func (s *Store) gtidPositionAvailable(ctx context.Context, checkpoint string) (bool, error) {
+	checkpointSet, err := gomysql.ParseGTIDSet(gomysql.MySQLFlavor, checkpoint)
+	if err != nil {
+		return false, fmt.Errorf("parse checkpoint GTID set: %w", err)
+	}
+	var executed, purged string
+	if err := s.db.QueryRowContext(ctx, `
+SELECT @@GLOBAL.gtid_executed, @@GLOBAL.gtid_purged`).Scan(&executed, &purged); err != nil {
+		return false, fmt.Errorf("read MySQL GTID state: %w", err)
+	}
+	executedSet, err := gomysql.ParseGTIDSet(gomysql.MySQLFlavor, executed)
+	if err != nil {
+		return false, fmt.Errorf("parse executed GTID set: %w", err)
+	}
+	if !executedSet.Contain(checkpointSet) {
+		return false, errors.New("MySQL source has not executed the durable GTID checkpoint")
+	}
+	purgedSet, err := gomysql.ParseGTIDSet(gomysql.MySQLFlavor, purged)
+	if err != nil {
+		return false, fmt.Errorf("parse purged GTID set: %w", err)
+	}
+	return checkpointSet.Contain(purgedSet), nil
 }
 
 func (s *Store) qualified(table string) string {

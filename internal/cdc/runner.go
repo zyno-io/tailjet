@@ -157,6 +157,17 @@ func (r *Runner) runLeader(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	gtidEnabled, err := r.store.GTIDEnabled(ctx)
+	if err != nil {
+		return err
+	}
+	if exists && position.GTID == "" && gtidEnabled {
+		r.logger.Info("migrating file-position checkpoint to GTID auto-positioning")
+		exists = false
+	}
+	if exists && position.GTID != "" && !gtidEnabled {
+		return errors.New("durable checkpoint uses GTIDs but MySQL gtid_mode is not ON")
+	}
 	if exists {
 		available, err := r.store.PositionAvailable(ctx, position)
 		if err != nil {
@@ -172,6 +183,9 @@ func (r *Runner) runLeader(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if gtidEnabled && position.GTID == "" {
+			return errors.New("MySQL gtid_mode is ON but binary log status returned no executed GTID set")
+		}
 	}
 	return r.stream(ctx, position, columns)
 }
@@ -182,7 +196,7 @@ func (r *Runner) snapshot(ctx context.Context) (outbox.Position, error) {
 	if err != nil {
 		return outbox.Position{}, err
 	}
-	r.logger.Info("starting outbox snapshot", "binlog", position.Name, "position", position.Pos)
+	r.logger.Info("starting outbox snapshot", "binlog", position.Name, "position", position.Pos, "gtid", position.GTID != "")
 
 	var afterID uint64
 	for {
@@ -207,7 +221,7 @@ func (r *Runner) snapshot(ctx context.Context) (outbox.Position, error) {
 		return outbox.Position{}, err
 	}
 	r.health.Checkpointed()
-	r.logger.Info("outbox snapshot complete", "binlog", position.Name, "position", position.Pos)
+	r.logger.Info("outbox snapshot complete", "binlog", position.Name, "position", position.Pos, "gtid", position.GTID != "")
 	return position, nil
 }
 
@@ -229,15 +243,29 @@ func (r *Runner) stream(ctx context.Context, position outbox.Position, columns o
 	})
 	defer syncer.Close()
 
-	streamer, err := syncer.StartSync(gomysql.Position{Name: position.Name, Pos: position.Pos})
-	if err != nil {
-		return fmt.Errorf("start MySQL replication at %s:%d: %w", position.Name, position.Pos, err)
+	var streamer *replication.BinlogStreamer
+	var err error
+	if position.GTID != "" {
+		gtidSet, err := gomysql.ParseGTIDSet(r.config.MySQLFlavor, position.GTID)
+		if err != nil {
+			return fmt.Errorf("parse durable GTID checkpoint: %w", err)
+		}
+		streamer, err = syncer.StartSyncGTID(gtidSet)
+		if err != nil {
+			return fmt.Errorf("start MySQL replication from GTID checkpoint: %w", err)
+		}
+	} else {
+		streamer, err = syncer.StartSync(gomysql.Position{Name: position.Name, Pos: position.Pos})
+		if err != nil {
+			return fmt.Errorf("start MySQL replication at %s:%d: %w", position.Name, position.Pos, err)
+		}
 	}
 	r.health.SetPhase("streaming", true, true, nil)
-	r.logger.Info("MySQL CDC stream started", "binlog", position.Name, "position", position.Pos)
+	r.logger.Info("MySQL CDC stream started", "binlog", position.Name, "position", position.Pos, "checkpoint_mode", checkpointMode(position))
 
 	processor := &streamProcessor{
 		currentFile:        position.Name,
+		currentGTID:        position.GTID,
 		lastCheckpoint:     time.Now(),
 		checkpointInterval: r.config.CheckpointInterval,
 		maxRows:            r.config.MaxTransactionRows,
@@ -370,6 +398,7 @@ func (r *Runner) retryFailed(ctx context.Context) error {
 
 type streamProcessor struct {
 	currentFile        string
+	currentGTID        string
 	pending            []outbox.Message
 	pendingBytes       int64
 	lastCheckpoint     time.Time
@@ -397,7 +426,7 @@ func (p *streamProcessor) process(ctx context.Context, event *replication.Binlog
 			return errors.New("binlog rotated with an open outbox transaction")
 		}
 		p.currentFile = string(value.NextLogName)
-		return p.maybeCheckpoint(ctx, outbox.Position{Name: p.currentFile, Pos: uint32(value.Position)})
+		return p.maybeCheckpoint(ctx, p.position(uint32(value.Position), nil))
 
 	case *replication.RowsEvent:
 		if value.Type() != replication.EnumRowsEventTypeInsert {
@@ -406,15 +435,15 @@ func (p *streamProcessor) process(ctx context.Context, event *replication.Binlog
 		return p.addRows(value)
 
 	case *replication.XIDEvent:
-		return p.commit(ctx, event.Header.LogPos)
+		return p.commit(ctx, event.Header.LogPos, value.GSet)
 
 	case *replication.QueryEvent:
 		switch strings.ToUpper(strings.TrimSpace(string(value.Query))) {
 		case "COMMIT":
-			return p.commit(ctx, event.Header.LogPos)
+			return p.commit(ctx, event.Header.LogPos, value.GSet)
 		case "ROLLBACK":
 			p.clearPending()
-			return p.maybeCheckpoint(ctx, outbox.Position{Name: p.currentFile, Pos: event.Header.LogPos})
+			return p.maybeCheckpoint(ctx, p.position(event.Header.LogPos, value.GSet))
 		}
 
 	case *replication.TransactionPayloadEvent:
@@ -430,7 +459,7 @@ func (p *streamProcessor) process(ctx context.Context, event *replication.Binlog
 				return err
 			}
 		}
-		return p.commit(ctx, event.Header.LogPos)
+		return p.commit(ctx, event.Header.LogPos, transactionPayloadGTID(value))
 	}
 	return nil
 }
@@ -453,11 +482,11 @@ func (p *streamProcessor) addRows(event *replication.RowsEvent) error {
 	return nil
 }
 
-func (p *streamProcessor) commit(ctx context.Context, logPosition uint32) error {
+func (p *streamProcessor) commit(ctx context.Context, logPosition uint32, gtidSet gomysql.GTIDSet) error {
 	if logPosition == 0 {
 		return errors.New("transaction commit has a zero binlog position")
 	}
-	position := outbox.Position{Name: p.currentFile, Pos: logPosition}
+	position := p.position(logPosition, gtidSet)
 	if len(p.pending) == 0 {
 		return p.maybeCheckpoint(ctx, position)
 	}
@@ -493,6 +522,36 @@ func (p *streamProcessor) commit(ctx context.Context, logPosition uint32) error 
 	p.lastCheckpoint = time.Now()
 	p.clearPending()
 	return nil
+}
+
+func (p *streamProcessor) position(logPosition uint32, gtidSet gomysql.GTIDSet) outbox.Position {
+	if gtidSet != nil {
+		p.currentGTID = gtidSet.String()
+	}
+	return outbox.Position{Name: p.currentFile, Pos: logPosition, GTID: p.currentGTID}
+}
+
+func transactionPayloadGTID(event *replication.TransactionPayloadEvent) gomysql.GTIDSet {
+	for i := len(event.Events) - 1; i >= 0; i-- {
+		switch value := event.Events[i].Event.(type) {
+		case *replication.XIDEvent:
+			if value.GSet != nil {
+				return value.GSet
+			}
+		case *replication.QueryEvent:
+			if value.GSet != nil {
+				return value.GSet
+			}
+		}
+	}
+	return nil
+}
+
+func checkpointMode(position outbox.Position) string {
+	if position.GTID != "" {
+		return "gtid"
+	}
+	return "file-position"
 }
 
 func (p *streamProcessor) maybeCheckpoint(ctx context.Context, position outbox.Position) error {

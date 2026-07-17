@@ -15,7 +15,8 @@ process reached NATS” without adding NATS concerns to application code.
 2. One replica acquires a MySQL advisory lock. Additional Kubernetes replicas
    remain hot standbys.
 3. The leader snapshots any existing outbox rows, then resumes the MySQL
-   replication stream from its durable file/position checkpoint.
+   replication stream from its durable GTID checkpoint. If GTIDs are disabled,
+   Tailjet falls back to a file/position checkpoint.
 4. Insert row events are buffered until the transaction's `XID`/`COMMIT` event.
 5. Tailjet synchronously publishes each message and waits for a JetStream
    persistence acknowledgement.
@@ -120,11 +121,23 @@ If the transaction rolls back, Tailjet publishes nothing.
 - MySQL with `log_bin=ON`
 - `binlog_format=ROW`
 - `binlog_row_image=FULL`
+- `gtid_mode=ON` and `enforce_gtid_consistency=ON` for node-independent
+  checkpoints and writer failover
 - InnoDB for the outbox and state tables
 - A unique, non-zero `TAILJET_MYSQL_SERVER_ID` for this replication client
-- Enough binlog retention to cover normal downtime. If a saved file has been
-  purged, Tailjet safely snapshots the remaining (unacknowledged) outbox rows
-  and starts at the current binary log position.
+- Enough binlog retention to cover normal downtime. Tailjet verifies that a
+  GTID checkpoint includes every purged transaction before resuming. If the
+  required history has been purged, it safely snapshots the remaining
+  unacknowledged outbox rows and starts at the current GTID set.
+
+With GTIDs enabled, Tailjet stores `Executed_Gtid_Set` with each durable
+checkpoint and reconnects with MySQL auto-positioning. Binlog filenames are
+kept for diagnostics but are not used to choose the resume point. Every
+Tailjet replica must use the same single-writer endpoint (for example, the PXC
+HAProxy writer service), and that endpoint may move between synchronized
+nodes. An existing file/position checkpoint is migrated by snapshotting only
+the rows still present in the outbox and recording a fresh GTID boundary; rows
+already acknowledged and deleted are not republished by that migration.
 
 Example relay grants:
 
@@ -285,9 +298,11 @@ external condition, then trigger a retry.
   files from Kubernetes Secrets.
 - Ensure source-side binlog filters include the outbox database and application
   sessions do not disable binary logging.
-- Point every replica at the same MySQL writer endpoint; the advisory lock,
-  replication stream, outbox cleanup, and checkpoint writes must reach one
-  current primary at a time.
+- Enable GTIDs and point every replica at the same single-writer endpoint; the
+  advisory lock, replication stream, outbox cleanup, and checkpoint writes
+  must reach one current primary at a time. Configure the proxy to terminate
+  existing sessions whenever it changes the active writer so the old
+  node-local advisory lock cannot overlap a new leader.
 - Size MySQL binlog retention and the JetStream duplicate window for the longest
   credible outage, and keep downstream consumers idempotent.
 - Grant the NATS account publish access only to owned subjects and subscribe
