@@ -372,31 +372,6 @@ ORDER BY ORDINAL_POSITION`, s.database, s.outboxTable)
 	return index, nil
 }
 
-func (s *Store) AcquireLeader(ctx context.Context, lockName string) (*sql.Conn, bool, error) {
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, false, fmt.Errorf("reserve leader connection: %w", err)
-	}
-	var acquired sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", lockName).Scan(&acquired); err != nil {
-		_ = conn.Close()
-		return nil, false, fmt.Errorf("acquire MySQL leader lock: %w", err)
-	}
-	if !acquired.Valid || acquired.Int64 != 1 {
-		_ = conn.Close()
-		return nil, false, nil
-	}
-	return conn, true, nil
-}
-
-func ReleaseLeader(ctx context.Context, conn *sql.Conn, lockName string) {
-	if conn == nil {
-		return
-	}
-	_, _ = conn.ExecContext(ctx, "SELECT RELEASE_LOCK(?)", lockName)
-	_ = conn.Close()
-}
-
 func (s *Store) LoadPosition(ctx context.Context) (Position, bool, error) {
 	var position Position
 	var value uint64

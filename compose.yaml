@@ -61,5 +61,7 @@ services:
       TAILJET_MYSQL_DATABASE: tailjet
       TAILJET_NATS_URL: nats://nats:4222
       TAILJET_NATS_EXPECTED_STREAM: EVENTS
+      # Local Compose runs one relay. Kubernetes Lease election is the default.
+      TAILJET_LEADER_ELECTION_MODE: disabled
     ports:
       - "18080:8080"

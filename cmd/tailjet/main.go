@@ -22,6 +22,7 @@ import (
 	"github.com/zyno-io/tailjet/internal/cdc"
 	"github.com/zyno-io/tailjet/internal/config"
 	"github.com/zyno-io/tailjet/internal/health"
+	"github.com/zyno-io/tailjet/internal/leadership"
 	"github.com/zyno-io/tailjet/internal/outbox"
 	"github.com/zyno-io/tailjet/internal/publisher"
 )
@@ -66,6 +67,20 @@ func run(logger *slog.Logger) error {
 	store := outbox.NewStore(db, cfg.MySQLDatabase, cfg.OutboxTable, cfg.StateTable, cfg.ConsumerName)
 	messagePublisher := publisher.New(js, natsConn, cfg.MySQLDatabase, cfg.OutboxTable, cfg.NATSExpectedStream, cfg.PublishTimeout)
 	runner := cdc.NewRunner(cfg, mysqlTLS, store, messagePublisher, tracker, logger)
+	var leaderManager *leadership.Manager
+	if cfg.LeaderElectionMode == "kubernetes" {
+		leaderManager, err = leadership.NewInCluster(leadership.Settings{
+			Namespace:     cfg.LeaderLeaseNamespace,
+			Name:          cfg.LeaderLeaseName,
+			Identity:      cfg.LeaderIdentity,
+			LeaseDuration: cfg.LeaderLeaseDuration,
+			RenewDeadline: cfg.LeaderRenewDeadline,
+			RetryPeriod:   cfg.LeaderRetryPeriod,
+		}, tracker, logger, "tailjet/"+version)
+		if err != nil {
+			return err
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -103,7 +118,13 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 	go func() {
-		errorsCh <- runner.Run(ctx)
+		if leaderManager == nil {
+			logger.Warn("Kubernetes leader election is disabled; only one Tailjet replica may run safely")
+			tracker.SetPhase("starting-leader", false, true, nil)
+			errorsCh <- runner.RunLeader(ctx)
+			return
+		}
+		errorsCh <- leaderManager.Run(ctx, runner.RunLeader)
 	}()
 
 	select {

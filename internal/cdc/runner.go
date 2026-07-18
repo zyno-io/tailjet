@@ -3,7 +3,6 @@ package cdc
 import (
 	"context"
 	"crypto/tls"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -61,14 +60,14 @@ func (r *Runner) TriggerRetry() bool {
 	}
 }
 
-func (r *Runner) Run(ctx context.Context) error {
+func (r *Runner) RunLeader(ctx context.Context) error {
 	prepared := false
 	for ctx.Err() == nil {
 		if !prepared {
 			if err := r.prepare(ctx); err != nil {
-				r.health.SetPhase("waiting-for-mysql", false, false, err)
+				r.health.SetPhase("waiting-for-mysql", false, true, err)
 				r.logger.Error("MySQL preparation failed", "error", err)
-				if !wait(ctx, r.config.LeaderRetryInterval) {
+				if !wait(ctx, r.config.RecoveryRetryInterval) {
 					break
 				}
 				continue
@@ -76,61 +75,21 @@ func (r *Runner) Run(ctx context.Context) error {
 			prepared = true
 		}
 
-		leaderConn, acquired, err := r.store.AcquireLeader(ctx, r.config.LeaderLockName)
-		if err != nil {
-			prepared = false
-			r.health.SetPhase("waiting-for-leader-lock", false, false, err)
-			r.logger.Error("leader lock failed", "error", err)
-			if !wait(ctx, r.config.LeaderRetryInterval) {
-				break
-			}
-			continue
-		}
-		if !acquired {
-			failedRows, countErr := r.store.CountFailed(ctx)
-			if countErr != nil {
-				prepared = false
-				r.health.SetPhase("waiting-for-mysql", false, false, countErr)
-				r.logger.Error("failed to count retained outbox rows", "error", countErr)
-				if !wait(ctx, r.config.LeaderRetryInterval) {
-					break
-				}
-				continue
-			}
-			r.health.SetFailedRows(failedRows)
-			r.health.SetPhase("standby", true, false, nil)
-			if !wait(ctx, r.config.LeaderRetryInterval) {
-				break
-			}
-			continue
-		}
-
-		r.logger.Info("acquired MySQL leader lock", "lock", r.config.LeaderLockName)
-		leaderCtx, cancelLeader := context.WithCancelCause(ctx)
-		go monitorLeaderConnection(leaderCtx, leaderConn, cancelLeader)
-		err = r.runLeader(leaderCtx)
-		cancelLeader(nil)
+		err := r.runLeader(ctx)
 		prepared = false
-
-		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		outbox.ReleaseLeader(releaseCtx, leaderConn, r.config.LeaderLockName)
-		releaseCancel()
 		if ctx.Err() != nil {
 			break
-		}
-		if cause := context.Cause(leaderCtx); cause != nil && !errors.Is(cause, context.Canceled) {
-			err = errors.Join(err, cause)
 		}
 		if err == nil {
 			err = errors.New("leader loop stopped unexpectedly")
 		}
-		r.health.SetPhase("recovering", false, false, err)
+		r.health.SetPhase("recovering", false, true, err)
 		r.logger.Error("CDC leader stopped; retrying from the durable checkpoint", "error", err)
-		if !wait(ctx, r.config.LeaderRetryInterval) {
+		if !wait(ctx, r.config.RecoveryRetryInterval) {
 			break
 		}
 	}
-	return ctx.Err()
+	return context.Cause(ctx)
 }
 
 func (r *Runner) prepare(ctx context.Context) error {
@@ -569,25 +528,6 @@ func (p *streamProcessor) maybeCheckpoint(ctx context.Context, position outbox.P
 func (p *streamProcessor) clearPending() {
 	p.pending = nil
 	p.pendingBytes = 0
-}
-
-func monitorLeaderConnection(ctx context.Context, conn *sql.Conn, cancel context.CancelCauseFunc) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
-			err := conn.PingContext(pingCtx)
-			pingCancel()
-			if err != nil {
-				cancel(fmt.Errorf("MySQL leader lock connection was lost: %w", err))
-				return
-			}
-		}
-	}
 }
 
 func wait(ctx context.Context, duration time.Duration) bool {

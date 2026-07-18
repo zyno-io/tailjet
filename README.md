@@ -12,8 +12,8 @@ process reached NATS” without adding NATS concerns to application code.
 
 1. On startup, Tailjet creates `tailjet_outbox` and its internal
    `tailjet_state` checkpoint table if they do not exist.
-2. One replica acquires a MySQL advisory lock. Additional Kubernetes replicas
-   remain hot standbys.
+2. One replica acquires a Kubernetes `coordination.k8s.io/v1` Lease. Additional
+   replicas remain hot standbys.
 3. The leader snapshots any existing outbox rows, then resumes the MySQL
    replication stream from its durable GTID checkpoint. If GTIDs are disabled,
    Tailjet falls back to a file/position checkpoint.
@@ -100,12 +100,12 @@ is running.
 ```sql
 START TRANSACTION;
 
-UPDATE example_records
+UPDATE application.example_records
 SET value = 'updated',
     revision = revision + 1
 WHERE id = 'example-1';
 
-INSERT INTO tailjet_outbox (subject, payload, headers, message_id, ttl_seconds)
+INSERT INTO tailjet.tailjet_outbox (subject, payload, headers, message_id, ttl_seconds)
 VALUES (
     'events.record-changed',
     JSON_OBJECT(
@@ -122,6 +122,12 @@ COMMIT;
 ```
 
 If the transaction rolls back, Tailjet publishes nothing.
+
+A dedicated Tailjet database lets one relay serve multiple applications. Each
+producer writes a qualified `tailjet.tailjet_outbox` row through the same
+MySQL session and transaction as its application changes. The application
+schemas and Tailjet database must be on the same MySQL server or PXC cluster;
+cross-server writes are not atomic and do not provide the outbox guarantee.
 
 ## MySQL requirements
 
@@ -153,14 +159,18 @@ already acknowledged and deleted are not republished by that migration.
 Example relay grants:
 
 ```sql
+CREATE DATABASE tailjet;
 CREATE USER 'tailjet'@'%' IDENTIFIED BY 'replace-me';
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER ON app.* TO 'tailjet'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER ON tailjet.* TO 'tailjet'@'%';
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'tailjet'@'%';
+GRANT INSERT ON tailjet.tailjet_outbox TO 'application'@'%';
 ```
 
 The database-scoped grants allow Tailjet to create and maintain its two
-tables. Use a separate application account with only `INSERT` on
-`app.tailjet_outbox`.
+tables. Give every producer account only `INSERT` on the shared outbox table.
+Start Tailjet once so it creates `tailjet_outbox` before applying the
+table-scoped producer grant; MySQL rejects a table grant when the table does
+not yet exist.
 
 ## NATS requirements
 
@@ -221,15 +231,17 @@ kubectl create secret generic tailjet \
 kubectl apply -k deploy/kubernetes
 ```
 
-The example uses two pods. Only the pod holding the MySQL advisory lock opens a
-replication stream; the other reports ready in the `standby` phase. Losing the
-lock connection immediately cancels the leader loop before another pod can
-take over.
+The example uses two pods. Only the pod holding the Kubernetes Lease opens a
+replication stream; the other reports ready in the `standby` phase. If Lease
+renewal exceeds the renew deadline, Tailjet cancels the leader's CDC context
+and exits. A standby waits for the full Lease duration from the last successful
+renewal before taking over.
 
 The container runs non-root with a read-only root filesystem. Configure TLS
 and credential volumes in your overlay; do not put production credentials in
-the ConfigMap. The starter also disables service-account token mounting,
-spreads replicas across nodes when capacity permits, and protects one replica
+the ConfigMap. The starter mounts a projected service-account token and grants
+only `get`, `create`, and `update` access to Leases in its namespace. It also
+spreads replicas across nodes when capacity permits and protects one replica
 from voluntary disruption with a PodDisruptionBudget. Its `GOMEMLIMIT` leaves
 headroom below the container memory limit; keep those settings aligned in
 production overlays.
@@ -253,7 +265,13 @@ All configuration is via environment variables.
 | `TAILJET_OUTBOX_TABLE` | `tailjet_outbox` | Application-facing table name |
 | `TAILJET_STATE_TABLE` | `tailjet_state` | Internal checkpoint table name |
 | `TAILJET_CONSUMER_NAME` | `default` | Checkpoint identity |
-| `TAILJET_LEADER_LOCK_NAME` | derived | MySQL advisory lock, at most 64 bytes |
+| `TAILJET_LEADER_ELECTION_MODE` | `kubernetes` | `kubernetes`, or `disabled` for an explicitly single-replica development process |
+| `TAILJET_LEADER_LEASE_NAME` | derived | Kubernetes Lease name; deployments should set a stable explicit value |
+| `TAILJET_LEADER_LEASE_NAMESPACE` | `default` | Namespace containing the Lease |
+| `TAILJET_LEADER_IDENTITY` | pod hostname | Unique candidate identity; deployments should use the pod name |
+| `TAILJET_LEADER_LEASE_DURATION` | `15s` | Time without a renewal before a standby may take over |
+| `TAILJET_LEADER_RENEW_DEADLINE` | `10s` | Maximum time the leader retries Lease renewal before stopping CDC |
+| `TAILJET_LEADER_RETRY_PERIOD` | `2s` | Kubernetes Lease acquisition/renewal retry period |
 | `TAILJET_NATS_URL` | `nats://127.0.0.1:4222` | One or more NATS URLs |
 | `TAILJET_NATS_USER` / `_PASSWORD` | empty | User/password authentication |
 | `TAILJET_NATS_TOKEN` | empty | Token authentication |
@@ -263,7 +281,7 @@ All configuration is via environment variables.
 | `TAILJET_NATS_EXPECTED_STREAM` | empty | Assert the destination stream |
 | `TAILJET_PUBLISH_TIMEOUT` | `10s` | Per-message acknowledgement timeout |
 | `TAILJET_CHECKPOINT_INTERVAL` | `5s` | Checkpoint interval without messages |
-| `TAILJET_LEADER_RETRY_INTERVAL` | `5s` | Standby/recovery retry interval |
+| `TAILJET_RECOVERY_RETRY_INTERVAL` | `5s` | MySQL preparation and CDC recovery retry interval |
 | `TAILJET_SNAPSHOT_BATCH_SIZE` | `500` | Rows per startup snapshot batch |
 | `TAILJET_MAX_TRANSACTION_ROWS` | `10000` | Memory guard for one transaction |
 | `TAILJET_MAX_TRANSACTION_BYTES` | `67108864` | Byte guard for one transaction |
@@ -309,11 +327,12 @@ external condition, then trigger a retry.
   files from Kubernetes Secrets.
 - Ensure source-side binlog filters include the outbox database and application
   sessions do not disable binary logging.
-- Enable GTIDs and point every replica at the same single-writer endpoint; the
-  advisory lock, replication stream, outbox cleanup, and checkpoint writes
-  must reach one current primary at a time. Configure the proxy to terminate
-  existing sessions whenever it changes the active writer so the old
-  node-local advisory lock cannot overlap a new leader.
+- Enable GTIDs and point every replica at the same single-writer endpoint so
+  replication, outbox cleanup, and checkpoint writes follow writer failover.
+- Keep node clocks synchronized, monitor Lease transitions, and grant the
+  Tailjet ServiceAccount only the namespace-scoped Lease permissions shown in
+  the starter manifests. The renew deadline must be shorter than the Lease
+  duration so a former leader stops before a standby can take over.
 - Size MySQL binlog retention and the JetStream duplicate window for the longest
   credible outage, and keep downstream consumers idempotent.
 - Grant the NATS account publish access only to owned subjects and subscribe
@@ -326,6 +345,9 @@ external condition, then trigger a retry.
 - Pin the published container by digest in the production overlay.
 
 ## Development
+
+Docker Compose sets `TAILJET_LEADER_ELECTION_MODE=disabled` because it runs one
+relay outside Kubernetes. Never use disabled mode with more than one replica.
 
 ```sh
 go test ./...

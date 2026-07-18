@@ -58,12 +58,6 @@ wait_for_sql() {
   return 1
 }
 
-stream_messages() {
-  docker compose run --rm nats-init \
-    nats --server=nats://nats:4222 stream info EVENTS --json 2>/dev/null |
-    jq -r '.state.messages'
-}
-
 last_message_header() {
   local subject=$1
   local header=$2
@@ -73,6 +67,12 @@ last_message_header() {
     base64 -d |
     tr -d '\r' |
     awk -F': ' -v expected="$header" 'tolower($1) == tolower(expected) { print $2 }'
+}
+
+last_message_exists() {
+  local subject=$1
+  docker compose run --rm nats-init \
+    nats --server=nats://nats:4222 stream get EVENTS --last-for="$subject" --json >/dev/null 2>&1
 }
 
 docker compose up -d mysql nats
@@ -118,22 +118,20 @@ wait_for_sql "1" "SELECT COUNT(*) FROM tailjet_state WHERE consumer_name='defaul
 
 mysql_query "
 INSERT INTO tailjet_outbox(subject,payload,message_id,ttl_seconds)
-VALUES ('events.ttl','{}','integration-ttl',2)"
+VALUES ('events.ttl','{}','integration-ttl',10)"
 wait_for_sql "0" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-ttl'"
 ttl_header=$(last_message_header events.ttl Nats-TTL)
-[[ "$ttl_header" == "2s" ]] || {
-  echo "expected Nats-TTL: 2s; got '$ttl_header'" >&2
+[[ "$ttl_header" == "10s" ]] || {
+  echo "expected Nats-TTL: 10s; got '$ttl_header'" >&2
   exit 1
 }
-for _ in {1..80}; do
-  if ! docker compose run --rm nats-init \
-    nats --server=nats://nats:4222 stream get EVENTS --last-for=events.ttl --json >/dev/null 2>&1; then
+for _ in {1..120}; do
+  if ! last_message_exists events.ttl; then
     break
   fi
   sleep 0.25
 done
-if docker compose run --rm nats-init \
-  nats --server=nats://nats:4222 stream get EVENTS --last-for=events.ttl --json >/dev/null 2>&1; then
+if last_message_exists events.ttl; then
   echo "TTL message did not expire from JetStream" >&2
   exit 1
 fi
@@ -160,17 +158,18 @@ retried_ttl_header=$(last_message_header events.invalid-ttl Nats-TTL)
   exit 1
 }
 
-before_rollback=$(stream_messages)
 mysql_query "
 START TRANSACTION;
 INSERT INTO tailjet_outbox(subject,payload,message_id)
 VALUES ('events.rollback','{}','integration-rollback');
 ROLLBACK;"
 sleep 1
-[[ "$(stream_messages)" == "$before_rollback" ]]
+if last_message_exists events.rollback; then
+  echo "rolled-back message was published" >&2
+  exit 1
+fi
 [[ "$(mysql_query "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-rollback'")" == "0" ]]
 
-before_skip=$(stream_messages)
 mysql_query "
 START TRANSACTION;
 INSERT INTO tailjet_outbox(subject,payload,message_id) VALUES
@@ -179,7 +178,10 @@ INSERT INTO tailjet_outbox(subject,payload,message_id) VALUES
 COMMIT;"
 wait_for_sql "1" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-retained' AND attempt_count=1"
 wait_for_sql "0" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-delivered'"
-[[ "$(stream_messages)" == "$((before_skip + 1))" ]]
+last_message_exists events.after-failure || {
+  echo "row after a failed publish was not delivered" >&2
+  exit 1
+}
 
 metrics=$(curl -fsS http://localhost:18080/metrics)
 grep -q '^tailjet_failed_rows 1$' <<<"$metrics"
@@ -224,44 +226,6 @@ status=$(curl -fsS http://localhost:18080/status)
 [[ "$(jq -r '.ready' <<<"$status")" == "true" ]]
 [[ "$(jq -r '.leader' <<<"$status")" == "true" ]]
 [[ "$(jq -r '.failedRows' <<<"$status")" == "0" ]]
-
-standby_container=$(docker compose run -d --no-deps --name tailjet-standby -p 18081:8080 tailjet)
-standby_status=""
-for _ in {1..60}; do
-  standby_status=$(curl -fsS http://localhost:18081/status 2>/dev/null || true)
-  if [[ -n "$standby_status" ]] && [[ "$(jq -r '.ready // false' <<<"$standby_status")" == "true" ]]; then
-    break
-  fi
-  sleep 0.25
-done
-[[ -n "$standby_status" ]]
-if [[ "$(jq -r '.phase' <<<"$standby_status")" != "standby" ]] ||
-  [[ "$(jq -r '.leader' <<<"$standby_status")" != "false" ]]; then
-  echo "second replica did not become a ready standby: $standby_status" >&2
-  exit 1
-fi
-wait_for_sql "1" "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE COMMAND LIKE 'Binlog Dump%'"
-
-docker compose stop tailjet >/dev/null
-for _ in {1..80}; do
-  promoted_status=$(curl -fsS http://localhost:18081/status 2>/dev/null || true)
-  if [[ -n "$promoted_status" ]] && [[ "$(jq -r '.leader' <<<"$promoted_status")" == "true" ]]; then
-    break
-  fi
-  sleep 0.25
-done
-[[ -n "$promoted_status" ]] && [[ "$(jq -r '.leader' <<<"$promoted_status")" == "true" ]] || {
-  echo "standby was not promoted after leader termination" >&2
-  exit 1
-}
-before_failover=$(stream_messages)
-mysql_query "
-INSERT INTO tailjet_outbox(subject,payload,message_id)
-VALUES ('events.failover','{}','integration-failover')"
-wait_for_sql "0" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-failover'"
-[[ "$(stream_messages)" == "$((before_failover + 1))" ]]
-
-docker stop "$standby_container" >/dev/null
 
 greenfield_container=$(docker compose run -d --no-deps \
   --name tailjet-greenfield \

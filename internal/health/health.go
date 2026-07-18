@@ -128,7 +128,7 @@ func (t *Tracker) Handler(triggerRetry func() bool) http.Handler {
 		status := t.Snapshot()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		writeMetric(w, "tailjet_ready", "Whether this pod is ready to serve as leader or standby.", "gauge", boolFloat(status.Ready))
-		writeMetric(w, "tailjet_leader", "Whether this pod currently holds the MySQL leader lock.", "gauge", boolFloat(status.Leader))
+		writeMetric(w, "tailjet_leader", "Whether this pod currently holds the Kubernetes leader Lease.", "gauge", boolFloat(status.Leader))
 		writeMetric(w, "tailjet_published_messages_total", "JetStream messages acknowledged by this process.", "counter", float64(status.PublishedMessages))
 		writeMetric(w, "tailjet_errors_total", "Errors observed by this process.", "counter", float64(status.ErrorsTotal))
 		writeMetric(w, "tailjet_publish_errors_total", "JetStream publish attempts that failed.", "counter", float64(status.PublishErrorsTotal))
