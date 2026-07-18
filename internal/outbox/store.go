@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS %s (
     payload LONGBLOB NOT NULL,
     headers JSON NULL,
     message_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    ttl_seconds INT UNSIGNED NULL,
     attempt_count INT UNSIGNED NOT NULL DEFAULT 0,
     last_attempt_at TIMESTAMP(6) NULL,
     last_error TEXT NULL,
@@ -53,6 +54,9 @@ CREATE TABLE IF NOT EXISTS %s (
     ),
     CHECK (
         headers IS NULL OR JSON_TYPE(headers) = 'OBJECT'
+    ),
+    CHECK (
+        ttl_seconds IS NULL OR ttl_seconds > 0
     )
 ) ENGINE=InnoDB`, s.qualified(s.outboxTable))
 	if _, err := s.db.ExecContext(ctx, outboxDDL); err != nil {
@@ -62,7 +66,8 @@ CREATE TABLE IF NOT EXISTS %s (
 		name       string
 		definition string
 	}{
-		{"attempt_count", "INT UNSIGNED NOT NULL DEFAULT 0 AFTER message_id"},
+		{"ttl_seconds", "INT UNSIGNED NULL AFTER message_id"},
+		{"attempt_count", "INT UNSIGNED NOT NULL DEFAULT 0 AFTER ttl_seconds"},
 		{"last_attempt_at", "TIMESTAMP(6) NULL AFTER attempt_count"},
 		{"last_error", "TEXT NULL AFTER last_attempt_at"},
 	} {
@@ -129,6 +134,9 @@ WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`, s.database, table).Scan(&engine)
 		{"payload", func(c columnDefinition) bool { return c.dataType == "longblob" && !c.nullable }},
 		{"headers", func(c columnDefinition) bool { return (c.dataType == "json" || c.dataType == "longtext") && c.nullable }},
 		{"message_id", func(c columnDefinition) bool { return c.dataType == "varchar" && c.nullable }},
+		{"ttl_seconds", func(c columnDefinition) bool {
+			return c.dataType == "int" && strings.Contains(c.columnType, "unsigned") && c.nullable
+		}},
 		{"attempt_count", func(c columnDefinition) bool {
 			return c.dataType == "int" && strings.Contains(c.columnType, "unsigned") && !c.nullable
 		}},
@@ -352,6 +360,7 @@ ORDER BY ORDINAL_POSITION`, s.database, s.outboxTable)
 		{"payload", &index.Payload},
 		{"headers", &index.Headers},
 		{"message_id", &index.MessageID},
+		{"ttl_seconds", &index.TTLSeconds},
 	}
 	for _, column := range required {
 		value, ok := columns[column.name]
@@ -493,7 +502,7 @@ WHERE id = ?`, s.qualified(s.outboxTable))
 
 func (s *Store) SnapshotBatch(ctx context.Context, afterID uint64, limit int) ([]Message, error) {
 	query := fmt.Sprintf(`
-SELECT id, subject, payload, headers, message_id, attempt_count
+SELECT id, subject, payload, headers, message_id, ttl_seconds, attempt_count
 FROM %s
 WHERE id > ?
 ORDER BY id
@@ -509,7 +518,7 @@ LIMIT ?`, s.qualified(s.outboxTable))
 
 func (s *Store) FailedBatch(ctx context.Context, afterID uint64, limit int) ([]Message, error) {
 	query := fmt.Sprintf(`
-SELECT id, subject, payload, headers, message_id, attempt_count
+SELECT id, subject, payload, headers, message_id, ttl_seconds, attempt_count
 FROM %s
 WHERE id > ? AND attempt_count > 0
 ORDER BY id
@@ -676,12 +685,14 @@ func scanMessages(rows *sql.Rows, description string) ([]Message, error) {
 	for rows.Next() {
 		var message Message
 		var headers, messageID sql.NullString
+		var ttlSeconds sql.NullInt64
 		if err := rows.Scan(
 			&message.ID,
 			&message.Subject,
 			&message.Payload,
 			&headers,
 			&messageID,
+			&ttlSeconds,
 			&message.AttemptCount,
 		); err != nil {
 			return nil, fmt.Errorf("scan %s: %w", description, err)
@@ -691,6 +702,13 @@ func scanMessages(rows *sql.Rows, description string) ([]Message, error) {
 		}
 		if messageID.Valid {
 			message.MessageID = messageID.String
+		}
+		if ttlSeconds.Valid {
+			if ttlSeconds.Int64 < 0 || uint64(ttlSeconds.Int64) > uint64(^uint32(0)) {
+				return nil, fmt.Errorf("scan %s: ttl_seconds %d exceeds INT UNSIGNED", description, ttlSeconds.Int64)
+			}
+			value := uint32(ttlSeconds.Int64)
+			message.TTLSeconds = &value
 		}
 		messages = append(messages, message)
 	}

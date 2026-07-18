@@ -8,6 +8,7 @@ type Message struct {
 	Payload      []byte
 	Headers      []byte
 	MessageID    string
+	TTLSeconds   *uint32
 	AttemptCount uint32
 }
 
@@ -24,7 +25,11 @@ func (m Message) StableMessageID(database, table string) string {
 }
 
 func (m Message) Size() int64 {
-	return int64(len(m.Subject) + len(m.Payload) + len(m.Headers) + len(m.MessageID))
+	size := int64(len(m.Subject) + len(m.Payload) + len(m.Headers) + len(m.MessageID))
+	if m.TTLSeconds != nil {
+		size += 4
+	}
+	return size
 }
 
 type Position struct {
@@ -34,9 +39,10 @@ type Position struct {
 }
 
 type ColumnIndexes struct {
-	ID        int
-	Subject   int
-	Payload   int
-	Headers   int
-	MessageID int
+	ID         int
+	Subject    int
+	Payload    int
+	Headers    int
+	MessageID  int
+	TTLSeconds int
 }
