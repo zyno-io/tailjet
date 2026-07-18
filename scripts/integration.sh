@@ -64,6 +64,17 @@ stream_messages() {
     jq -r '.state.messages'
 }
 
+last_message_header() {
+  local subject=$1
+  local header=$2
+  docker compose run --rm nats-init \
+    nats --server=nats://nats:4222 stream get EVENTS --last-for="$subject" --json 2>/dev/null |
+    jq -r '.hdrs' |
+    base64 -d |
+    tr -d '\r' |
+    awk -F': ' -v expected="$header" 'tolower($1) == tolower(expected) { print $2 }'
+}
+
 docker compose up -d mysql nats
 wait_for_mysql
 mysql_query "
@@ -96,14 +107,58 @@ SELECT COUNT(*)
 FROM information_schema.COLUMNS
 WHERE TABLE_SCHEMA='tailjet'
   AND TABLE_NAME='tailjet_outbox'
-  AND COLUMN_NAME IN ('attempt_count','last_attempt_at','last_error')")
-[[ "$columns" == "3" ]] || {
-  echo "managed failure columns were not created" >&2
+  AND COLUMN_NAME IN ('ttl_seconds','attempt_count','last_attempt_at','last_error')")
+[[ "$columns" == "4" ]] || {
+  echo "managed TTL/failure columns were not created" >&2
   exit 1
 }
 
 wait_for_sql "1" "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='tailjet' AND TABLE_NAME='tailjet_state' AND COLUMN_NAME='gtid_set' AND DATA_TYPE='longtext'"
 wait_for_sql "1" "SELECT COUNT(*) FROM tailjet_state WHERE consumer_name='default' AND gtid_set IS NOT NULL AND CHAR_LENGTH(gtid_set) > 0"
+
+mysql_query "
+INSERT INTO tailjet_outbox(subject,payload,message_id,ttl_seconds)
+VALUES ('events.ttl','{}','integration-ttl',2)"
+wait_for_sql "0" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-ttl'"
+ttl_header=$(last_message_header events.ttl Nats-TTL)
+[[ "$ttl_header" == "2s" ]] || {
+  echo "expected Nats-TTL: 2s; got '$ttl_header'" >&2
+  exit 1
+}
+for _ in {1..80}; do
+  if ! docker compose run --rm nats-init \
+    nats --server=nats://nats:4222 stream get EVENTS --last-for=events.ttl --json >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+if docker compose run --rm nats-init \
+  nats --server=nats://nats:4222 stream get EVENTS --last-for=events.ttl --json >/dev/null 2>&1; then
+  echo "TTL message did not expire from JetStream" >&2
+  exit 1
+fi
+
+mysql_query "
+START TRANSACTION;
+INSERT INTO tailjet_outbox(subject,payload,message_id,ttl_seconds) VALUES
+  ('events.invalid-ttl','{}','integration-invalid-ttl',0),
+  ('events.after-invalid-ttl','{}','integration-after-invalid-ttl',NULL);
+COMMIT;"
+wait_for_sql "1" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-invalid-ttl' AND attempt_count=1"
+wait_for_sql "0" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-after-invalid-ttl'"
+invalid_ttl_logs=$(docker compose logs tailjet 2>&1 | grep -c 'integration-invalid-ttl' || true)
+[[ "$invalid_ttl_logs" -ge 1 ]] || {
+  echo "expected an error log for invalid ttl_seconds" >&2
+  exit 1
+}
+mysql_query "UPDATE tailjet_outbox SET ttl_seconds=5 WHERE message_id='integration-invalid-ttl'"
+curl -fsS -X POST http://localhost:18080/retry >/dev/null
+wait_for_sql "0" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integration-invalid-ttl'"
+retried_ttl_header=$(last_message_header events.invalid-ttl Nats-TTL)
+[[ "$retried_ttl_header" == "5s" ]] || {
+  echo "expected retried Nats-TTL: 5s; got '$retried_ttl_header'" >&2
+  exit 1
+}
 
 before_rollback=$(stream_messages)
 mysql_query "
@@ -128,7 +183,7 @@ wait_for_sql "0" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integrat
 
 metrics=$(curl -fsS http://localhost:18080/metrics)
 grep -q '^tailjet_failed_rows 1$' <<<"$metrics"
-grep -q '^tailjet_publish_errors_total 1$' <<<"$metrics"
+grep -q '^tailjet_publish_errors_total 2$' <<<"$metrics"
 
 curl -fsS -X POST http://localhost:18080/retry >/dev/null
 wait_for_sql "2" "SELECT attempt_count FROM tailjet_outbox WHERE message_id='integration-retained'"
@@ -207,5 +262,34 @@ wait_for_sql "0" "SELECT COUNT(*) FROM tailjet_outbox WHERE message_id='integrat
 [[ "$(stream_messages)" == "$((before_failover + 1))" ]]
 
 docker stop "$standby_container" >/dev/null
+
+greenfield_container=$(docker compose run -d --no-deps \
+  --name tailjet-greenfield \
+  -e TAILJET_OUTBOX_TABLE=greenfield_outbox \
+  -e TAILJET_STATE_TABLE=greenfield_state \
+  -e TAILJET_CONSUMER_NAME=greenfield \
+  -e TAILJET_MYSQL_SERVER_ID=240025 \
+  tailjet)
+wait_for_sql "1" "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='tailjet' AND TABLE_NAME='greenfield_outbox' AND COLUMN_NAME='ttl_seconds' AND COLUMN_TYPE='int unsigned' AND IS_NULLABLE='YES'"
+wait_for_sql "1" "
+SELECT COUNT(*)
+FROM information_schema.TABLE_CONSTRAINTS tc
+JOIN information_schema.CHECK_CONSTRAINTS cc
+  ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+ AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+WHERE tc.CONSTRAINT_SCHEMA='tailjet'
+  AND tc.TABLE_NAME='greenfield_outbox'
+  AND cc.CHECK_CLAUSE LIKE '%ttl_seconds%'"
+if mysql_query "INSERT INTO greenfield_outbox(subject,payload,message_id,ttl_seconds) VALUES ('events.greenfield-invalid','{}','greenfield-invalid',0)"; then
+  echo "clean-install outbox accepted zero ttl_seconds" >&2
+  exit 1
+fi
+mysql_query "
+INSERT INTO greenfield_outbox(subject,payload,message_id,ttl_seconds) VALUES
+  ('events.greenfield-ttl','{}','greenfield-ttl',3),
+  ('events.greenfield-no-ttl','{}','greenfield-no-ttl',NULL)"
+wait_for_sql "0" "SELECT COUNT(*) FROM greenfield_outbox"
+[[ "$(last_message_header events.greenfield-ttl Nats-TTL)" == "3s" ]]
+docker stop "$greenfield_container" >/dev/null
 
 echo "integration checks passed"

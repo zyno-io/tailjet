@@ -44,6 +44,26 @@ func TestParseHeadersRejectsReservedNATSHeaders(t *testing.T) {
 	}
 }
 
+func TestMessageTTL(t *testing.T) {
+	ttlSeconds := uint32(30)
+	ttl, ok, err := messageTTL(outbox.Message{TTLSeconds: &ttlSeconds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || ttl != 30*time.Second {
+		t.Fatalf("ttl = %s, ok = %v", ttl, ok)
+	}
+
+	if ttl, ok, err := messageTTL(outbox.Message{}); err != nil || ok || ttl != 0 {
+		t.Fatalf("empty ttl = %s, ok = %v, error = %v", ttl, ok, err)
+	}
+
+	zero := uint32(0)
+	if _, _, err := messageTTL(outbox.Message{TTLSeconds: &zero}); err == nil {
+		t.Fatal("expected zero ttl error")
+	}
+}
+
 func TestValidateSubject(t *testing.T) {
 	for _, subject := range []string{"events.record-changed", "records.changed"} {
 		if err := validateSubject(subject); err != nil {

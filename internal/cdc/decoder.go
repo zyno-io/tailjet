@@ -38,7 +38,7 @@ func (d *Decoder) Decode(event *replication.RowsEvent) ([]outbox.Message, error)
 }
 
 func (d *Decoder) decodeRow(row []any) (outbox.Message, error) {
-	maxIndex := max(d.columns.ID, d.columns.Subject, d.columns.Payload, d.columns.Headers, d.columns.MessageID)
+	maxIndex := max(d.columns.ID, d.columns.Subject, d.columns.Payload, d.columns.Headers, d.columns.MessageID, d.columns.TTLSeconds)
 	if len(row) <= maxIndex {
 		return outbox.Message{}, fmt.Errorf("outbox binlog row has %d columns; expected index %d", len(row), maxIndex)
 	}
@@ -66,13 +66,33 @@ func (d *Decoder) decodeRow(row []any) (outbox.Message, error) {
 	if err != nil {
 		return outbox.Message{}, fmt.Errorf("decode outbox row %d message_id: %w", id, err)
 	}
+	ttlSeconds, err := optionalUint32Value(row[d.columns.TTLSeconds])
+	if err != nil {
+		return outbox.Message{}, fmt.Errorf("decode outbox row %d ttl_seconds: %w", id, err)
+	}
 	return outbox.Message{
-		ID:        id,
-		Subject:   subject,
-		Payload:   payload,
-		Headers:   headers,
-		MessageID: messageID,
+		ID:         id,
+		Subject:    subject,
+		Payload:    payload,
+		Headers:    headers,
+		MessageID:  messageID,
+		TTLSeconds: ttlSeconds,
 	}, nil
+}
+
+func optionalUint32Value(value any) (*uint32, error) {
+	if value == nil {
+		return nil, nil
+	}
+	parsed, err := uint64Value(value)
+	if err != nil {
+		return nil, err
+	}
+	if parsed > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("value %d exceeds INT UNSIGNED", parsed)
+	}
+	result := uint32(parsed)
+	return &result, nil
 }
 
 func uint64Value(value any) (uint64, error) {

@@ -44,6 +44,7 @@ services:
             --storage=file \
             --replicas=1 \
             --dupe-window=24h \
+            --allow-msg-ttl \
             --defaults
 
   tailjet:

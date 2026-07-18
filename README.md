@@ -53,6 +53,7 @@ CREATE TABLE tailjet_outbox (
     payload LONGBLOB NOT NULL,
     headers JSON NULL,
     message_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    ttl_seconds INT UNSIGNED NULL,
     attempt_count INT UNSIGNED NOT NULL DEFAULT 0,
     last_attempt_at TIMESTAMP(6) NULL,
     last_error TEXT NULL,
@@ -68,6 +69,9 @@ CREATE TABLE tailjet_outbox (
     ),
     CHECK (
         headers IS NULL OR JSON_TYPE(headers) = 'OBJECT'
+    ),
+    CHECK (
+        ttl_seconds IS NULL OR ttl_seconds > 0
     )
 ) ENGINE=InnoDB;
 ```
@@ -78,8 +82,12 @@ CREATE TABLE tailjet_outbox (
 - `message_id` is optional but recommended. It must be globally unique within
   the target stream. If omitted, Tailjet derives a stable ID from the database,
   table, and row ID.
+- `ttl_seconds` is an optional positive per-message JetStream TTL. The TTL
+  starts when JetStream stores the message. The target stream must enable
+  per-message TTLs (`allow_msg_ttl`).
 - The `Nats-` header namespace is reserved. Put `Nats-Msg-Id` in
-  `message_id` and configure the expected stream through Tailjet.
+  `message_id`, put `Nats-TTL` in `ttl_seconds`, and configure the expected
+  stream through Tailjet.
 - `attempt_count`, `last_attempt_at`, and `last_error` are managed by Tailjet.
   Producers must leave them at their defaults.
 
@@ -97,7 +105,7 @@ SET value = 'updated',
     revision = revision + 1
 WHERE id = 'example-1';
 
-INSERT INTO tailjet_outbox (subject, payload, headers, message_id)
+INSERT INTO tailjet_outbox (subject, payload, headers, message_id, ttl_seconds)
 VALUES (
     'events.record-changed',
     JSON_OBJECT(
@@ -106,7 +114,8 @@ VALUES (
         'revision', 42
     ),
     JSON_OBJECT('Content-Type', 'application/json'),
-    'record:example-1:42'
+    'record:example-1:42',
+    300
 );
 
 COMMIT;
@@ -124,6 +133,8 @@ If the transaction rolls back, Tailjet publishes nothing.
 - `gtid_mode=ON` and `enforce_gtid_consistency=ON` for node-independent
   checkpoints and writer failover
 - InnoDB for the outbox and state tables
+- NATS Server 2.11 or newer and a stream with `allow_msg_ttl` enabled when
+  producers use `ttl_seconds`
 - A unique, non-zero `TAILJET_MYSQL_SERVER_ID` for this replication client
 - Enough binlog retention to cover normal downtime. Tailjet verifies that a
   GTID checkpoint includes every purged transaction before resuming. If the

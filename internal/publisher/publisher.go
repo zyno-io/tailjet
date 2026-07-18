@@ -58,6 +58,11 @@ func (p *Publisher) Publish(ctx context.Context, message outbox.Message) error {
 	options := []jetstream.PublishOpt{
 		jetstream.WithMsgID(message.StableMessageID(p.database, p.table)),
 	}
+	if ttl, ok, err := messageTTL(message); err != nil {
+		return fmt.Errorf("outbox row %d: %w", message.ID, err)
+	} else if ok {
+		options = append(options, jetstream.WithMsgTTL(ttl))
+	}
 	if p.expectedStream != "" {
 		options = append(options, jetstream.WithExpectStream(p.expectedStream))
 	}
@@ -68,6 +73,16 @@ func (p *Publisher) Publish(ctx context.Context, message outbox.Message) error {
 		return fmt.Errorf("publish outbox row %d to %q: %w", message.ID, message.Subject, err)
 	}
 	return nil
+}
+
+func messageTTL(message outbox.Message) (time.Duration, bool, error) {
+	if message.TTLSeconds == nil {
+		return 0, false, nil
+	}
+	if *message.TTLSeconds == 0 {
+		return 0, false, errors.New("ttl_seconds must be greater than zero")
+	}
+	return time.Duration(*message.TTLSeconds) * time.Second, true, nil
 }
 
 func parseHeaders(raw []byte) (nats.Header, error) {
