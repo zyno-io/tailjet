@@ -186,24 +186,43 @@ func (r *Runner) snapshot(ctx context.Context) (outbox.Position, error) {
 
 func (r *Runner) stream(ctx context.Context, position outbox.Position, columns outbox.ColumnIndexes) error {
 	syncer := replication.NewBinlogSyncer(replication.BinlogSyncerConfig{
-		ServerID:             r.config.MySQLServerID,
-		Flavor:               r.config.MySQLFlavor,
-		Host:                 r.config.MySQLHost,
-		Port:                 r.config.MySQLPort,
-		User:                 r.config.MySQLUser,
-		Password:             r.config.MySQLPassword,
-		Charset:              "utf8mb4",
-		TLSConfig:            r.mysqlTLS,
-		HeartbeatPeriod:      time.Second,
-		ReadTimeout:          30 * time.Second,
-		MaxReconnectAttempts: 0,
-		VerifyChecksum:       true,
-		Logger:               r.logger,
+		// Transaction payload events can contain a very large compressed
+		// transaction for a table unrelated to the outbox. Decode them ourselves
+		// so those row images are streamed past rather than materialized.
+		RawModeEnabled: true,
+		// Raw mode intentionally does not update go-mysql's internal GTID set.
+		// On a broken connection, return the error to RunLeader so it restarts
+		// from Tailjet's durable checkpoint instead of a stale in-memory one.
+		DisableRetrySync: true,
+		EventCacheCount:  1,
+		ServerID:         r.config.MySQLServerID,
+		Flavor:           r.config.MySQLFlavor,
+		Host:             r.config.MySQLHost,
+		Port:             r.config.MySQLPort,
+		User:             r.config.MySQLUser,
+		Password:         r.config.MySQLPassword,
+		Charset:          "utf8mb4",
+		TLSConfig:        r.mysqlTLS,
+		HeartbeatPeriod:  time.Second,
+		ReadTimeout:      30 * time.Second,
+		VerifyChecksum:   true,
+		Logger:           r.logger,
 	})
 	defer syncer.Close()
+	outboxDecoder := NewDecoder(r.config.MySQLDatabase, r.config.OutboxTable, columns)
+	var err error
+	decoder, err := newRawEventDecoder(
+		r.config.MySQLFlavor,
+		position.GTID,
+		outboxDecoder,
+		r.config.MaxTransactionRows,
+		r.config.MaxTransactionBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("create binlog event decoder: %w", err)
+	}
 
 	var streamer *replication.BinlogStreamer
-	var err error
 	if position.GTID != "" {
 		gtidSet, err := gomysql.ParseGTIDSet(r.config.MySQLFlavor, position.GTID)
 		if err != nil {
@@ -229,7 +248,7 @@ func (r *Runner) stream(ctx context.Context, position outbox.Position, columns o
 		checkpointInterval: r.config.CheckpointInterval,
 		maxRows:            r.config.MaxTransactionRows,
 		maxBytes:           r.config.MaxTransactionBytes,
-		decoder:            NewDecoder(r.config.MySQLDatabase, r.config.OutboxTable, columns),
+		decoder:            outboxDecoder,
 		store:              r.store,
 		publisher:          r.publisher,
 		health:             r.health,
@@ -268,7 +287,11 @@ func (r *Runner) stream(ctx context.Context, position outbox.Position, columns o
 				}
 				return fmt.Errorf("read MySQL binlog event: %w", result.err)
 			}
-			if err := processor.process(ctx, result.event); err != nil {
+			event, err := decoder.Decode(ctx, result.event)
+			if err != nil {
+				return fmt.Errorf("decode MySQL binlog event: %w", err)
+			}
+			if err := processor.process(ctx, event); err != nil {
 				return err
 			}
 		}
@@ -405,6 +428,15 @@ func (p *streamProcessor) process(ctx context.Context, event *replication.Binlog
 			return p.maybeCheckpoint(ctx, p.position(event.Header.LogPos, value.GSet))
 		}
 
+	case *decodedTransactionPayloadEvent:
+		if len(p.pending) != 0 {
+			return errors.New("compressed transaction began with pending outbox rows")
+		}
+		if err := p.addMessages(value.messages); err != nil {
+			return err
+		}
+		return p.commit(ctx, event.Header.LogPos, value.gtid)
+
 	case *replication.TransactionPayloadEvent:
 		if len(p.pending) != 0 {
 			return errors.New("compressed transaction began with pending outbox rows")
@@ -428,6 +460,10 @@ func (p *streamProcessor) addRows(event *replication.RowsEvent) error {
 	if err != nil {
 		return err
 	}
+	return p.addMessages(messages)
+}
+
+func (p *streamProcessor) addMessages(messages []outbox.Message) error {
 	for _, message := range messages {
 		p.pending = append(p.pending, message)
 		p.pendingBytes += message.Size()
