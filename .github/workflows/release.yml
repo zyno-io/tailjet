@@ -6,7 +6,7 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   verify:
@@ -70,3 +70,14 @@ jobs:
             REVISION=${{ github.sha }}
           provenance: mode=max
           sbom: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release create "${{ github.ref_name }}" \
+            --verify-tag \
+            --generate-notes \
+            --title "TailJet ${{ github.ref_name }}"
